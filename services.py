@@ -1,81 +1,205 @@
 # services.py
 import logging
+import json
+import numpy as np
+import glob # To read files
+import os
+
 from openai import AzureOpenAI, OpenAIError
 from config import Settings
 from schemas import ChatRequest
 
 # Set up a logger
 logger = logging.getLogger(__name__)
-
-# This will store chat histories.
 CHAT_HISTORY_CACHE = {}
 
 
 class ChatService:
     """
-    Manages the conversation logic, integrating NLU, RAG, and LLM.
+    Manages the conversation logic, integrating NLU and RAG
+    using two separate Azure OpenAI resources.
     """
     def __init__(self, settings: Settings):
-        """
-        Initializes the AzureOpenAI client upon creation.
-        """
         try:
-            self.client = AzureOpenAI(
-                api_key=settings.AZURE_OPENAI_KEY,
-                api_version=settings.AZURE_API_VERSION,
-                azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            # --- 1. CHAT CLIENT (For NLU and Chat Responses) ---
+            self.chat_client = AzureOpenAI(
+                api_key=settings.AZURE_OPENAI_CHAT_KEY,
+                api_version=settings.AZURE_OPENAI_CHAT_API_VERSION,
+                azure_endpoint=settings.AZURE_OPENAI_CHAT_ENDPOINT,
             )
-            self.deployment_name = settings.AZURE_OPENAI_DEPLOYMENT_NAME
-            logger.info("AzureOpenAI client initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize AzureOpenAI client: {e}")
-            self.client = None
+            self.chat_deployment = settings.AZURE_OPENAI_CHAT_DEPLOYMENT_NAME
+            logger.info("AzureOpenAI CHAT client initialized.")
 
-    def _mock_rasa_nlu(self, message: str) -> dict:
-        """
-        [MOCK] Simulates a call to a Rasa NLU server.
-        """
-        logger.info(f"Mock NLU processing message: {message}")
-        message_lower = message.lower()
-        
-        if "yes" in message_lower or "ok" in message_lower or "sure" in message_lower:
-            return {"intent": {"name": "affirm"}, "entities": []}
-        if "no" in message_lower or "not really" in message_lower:
-            return {"intent": {"name": "deny"}, "entities": []}
+            # --- 2. EMBEDDING CLIENT (For RAG) ---
+            self.embed_client = AzureOpenAI(
+                api_key=settings.AZURE_OPENAI_EMBED_KEY,
+                api_version=settings.AZURE_OPENAI_EMBED_API_VERSION,
+                azure_endpoint=settings.AZURE_OPENAI_EMBED_ENDPOINT,
+            )
+            self.embed_deployment = settings.AZURE_OPENAI_EMBED_DEPLOYMENT_NAME
+            logger.info("AzureOpenAI EMBEDDING client initialized.")
+
+            # --- In-Memory RAG Setup ---
+            self.rag_kb = [] # This will store (text, vector) tuples
+            self._init_in_memory_rag() # Load the RAG knowledge base
             
-        if "job" in message_lower or "deadline" in message_lower or "work" in message_lower:
-            return {"intent": {"name": "work_stress"}, "entities": []}
-        if "exam" in message_lower or "study" in message_lower:
-            return {"intent": {"name": "study_anxiety"}, "entities": []}
-        if "sad" in message_lower or "lonely" in message_lower:
-            return {"intent": {"name": "feeling_depressed"}, "entities": []}
-        return {"intent": {"name": "general_greeting"}, "entities": []}
+            logger.info(f"In-Memory RAG loaded with {len(self.rag_kb)} documents.")
 
-    def _mock_rag_retriever(self, intent: str) -> str:
+        except Exception as e:
+            logger.error(f"Failed to initialize ChatService: {e}")
+            self.chat_client = None
+            self.embed_client = None
+            
+    def _init_in_memory_rag(self):
         """
-        [MOCK] Simulates a RAG query to a vector database.
+        [RAG] Loads documents from 'docs/', creates embeddings, and stores them in memory.
         """
-        logger.info(f"Mock RAG retrieving for intent: {intent}")
-        rag_db = {
-            "work_stress": "Retrieved technique: 'The 5-4-3-2-1 grounding technique. Focus on five things you see, four things you feel, three things you hear, two things you smell, and one thing you taste. This helps anchor you to the present moment.'",
-            "study_anxiety": "Retrieved technique: 'The Pomodoro Technique. Break your study time into 25-minute focused intervals, followed by a 5-minute break. This makes the task less daunting.'",
-            "feeling_depressed": "Retrieved affirmation: 'It's okay to not be okay. Your feelings are valid. Remind the user to be kind to themselves and that this feeling will pass.'",
-            "general_greeting": "Retrieved context: 'User is starting the conversation. Be warm and welcoming. Ask an open-ended question about how they are feeling today.'",
-            "affirm": "Retrieved context: 'The user has agreed to a suggestion. Be encouraging and proceed with the next step.'",
-            "deny": "Retrieved context: 'The user has declined a suggestion. Be gentle, validate their choice, and offer an alternative, like just talking.'"
-        }
-        return rag_db.get(intent, "Retrieved context: 'Acknowledge the user's statement and ask a gentle, clarifying question.'")
-
-    def _build_llm_prompt(self, message: str, intent: str, context: str, history: list[dict]) -> list[dict]:
-        """
-        Builds the structured prompt for the LLM, now including history.
-        """
+        if not self.embed_client:
+            logger.error("RAG init failed: Embedding client not initialized.")
+            return
         
-        # --- !! NAME CHANGE IS HERE !! ---
+        doc_files = glob.glob("docs/*.txt")
+        for file_path in doc_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                    
+                    # Call the EMBEDDING client
+                    response = self.embed_client.embeddings.create(
+                        input=text, model=self.embed_deployment
+                    )
+                    vector = response.data[0].embedding
+                    
+                    self.rag_kb.append((text, np.array(vector)))
+                    logger.info(f"Embedded and stored: {os.path.basename(file_path)}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load/embed document {file_path}: {e}")
+
+    # --- THIS REPLACES _mock_rasa_nlu ---
+    def _get_nlu_intent(self, message: str) -> dict:
+        """
+        [NLU] Uses the CHAT client to classify the user's intent.
+        """
+        if not self.chat_client:
+            logger.error("NLU failed: Chat client not initialized.")
+            return {"intent": {"name": "unknown"}}
+        
+        system_prompt = (
+            "You are an NLU (Natural Language Understanding) classifier. "
+            "Analyze the user's message and respond *only* with a JSON object. "
+            "The JSON must have one key: 'intent'. "
+            "The intent must be one of the following strings: "
+            "['work_stress', 'study_anxiety', 'feeling_depressed', 'affirm', 'deny', 'general_greeting', 'unknown']"
+        )
+        
+        try:
+            # Call the CHAT client
+            response = self.chat_client.chat.completions.create(
+                model=self.chat_deployment,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=100
+            )
+            
+            intent_data = json.loads(response.choices[0].message.content)
+            intent = intent_data.get("intent", "unknown")
+            logger.info(f"NLU (OpenAI) detected intent: {intent}")
+            return {"intent": {"name": intent}}
+
+        except Exception as e:
+            logger.error(f"Error in OpenAI NLU call: {e}")
+            return {"intent": {"name": "unknown"}}
+
+    # --- THIS REPLACES _mock_rag_retriever ---
+    def _get_rag_context(self, message: str) -> str:
+        """
+        [RAG] Finds the most relevant context from the in-memory vector store.
+        """
+        if not self.embed_client or not self.rag_kb:
+            logger.error("RAG failed: Embedding client or KB not initialized.")
+            return "Retrieved context: 'Acknowledge the user's statement.'"
+
+        try:
+            # 1. Create embedding for the user's message (uses EMBED client)
+            response = self.embed_client.embeddings.create(
+                input=message, model=self.embed_deployment
+            )
+            query_vector = np.array(response.data[0].embedding)
+            
+            # 2. Calculate cosine similarity against all docs in memory
+            scores = [
+                np.dot(query_vector, doc_vector) / (np.linalg.norm(query_vector) * np.linalg.norm(doc_vector))
+                for _, doc_vector in self.rag_kb
+            ]
+            
+            # 3. Get the top-scoring document
+            top_index = np.argmax(scores)
+            top_text = self.rag_kb[top_index][0]
+            
+            logger.info(f"RAG (In-Memory) found best context with score {scores[top_index]}")
+            return f"Retrieved technique: '{top_text}'"
+
+        except Exception as e:
+            logger.error(f"Error in in-memory RAG retrieval: {e}")
+            return "Retrieved context: 'Acknowledge the user's statement...'"
+
+
+    # --- This main function now calls the new, real functions ---
+    def get_chat_response(self, request: ChatRequest) -> tuple[str, str, str]:
+        """
+        Main orchestration function.
+        """
+        if not self.chat_client or not self.embed_client:
+            logger.error("A required client is not initialized. Cannot process request.")
+            raise OpenAIError("The AI service is not configured correctly.")
+            
+        session_id = request.session_id or "default_session"
+        history = CHAT_HISTORY_CACHE.get(session_id, [])
+
+        # 1. NLU Step (Calls CHAT client)
+        nlu_data = self._get_nlu_intent(request.message)
+        intent = nlu_data.get("intent", {}).get("name", "unknown")
+
+        # 2. RAG Step (Calls EMBED client)
+        context = self._get_rag_context(request.message)
+        
+        # 3. LLM Generation Step
+        prompt = self._build_llm_prompt(request.message, intent, context, history)
+        
+        try:
+            # Calls the CHAT client
+            completion = self.chat_client.chat.completions.create(
+                model=self.chat_deployment,
+                messages=prompt,
+                temperature=0.7,
+                max_tokens=200,
+            )
+            
+            llm_response = completion.choices[0].message.content.strip()
+            
+            # 5. Save to cache
+            history.append({"role": "user", "content": request.message})
+            history.append({"role": "assistant", "content": llm_response})
+            CHAT_HISTORY_CACHE[session_id] = history
+
+            return llm_response, intent, context
+
+        except OpenAIError as e:
+            logger.error(f"Error calling Azure OpenAI: {e}")
+            raise
+            
+    # --- (This function is unchanged) ---
+    def _build_llm_prompt(self, message: str, intent: str, context: str, history: list[dict]) -> list[dict]:
+        
         SYSTEM_PROMPT = (
             "You are 'Luma', an AI emotional support chatbot. Your role is to "
             "help working professionals and students navigate stress and negative emotions. "
-            "You are empathetic, patient, and non-judgmental. "
+            "You are empathetic, patient, and non-jume."
             "NEVER give medical advice. "
             "Use the 'Retrieved Context' to help guide your response. "
             "The 'User Intent' is for your information. Do not mention it explicitly. "
@@ -98,54 +222,3 @@ class ChatService:
         })
         
         return messages
-
-    def get_chat_response(self, request: ChatRequest) -> tuple[str, str, str]:
-        """
-        Main orchestration function.
-        """
-        if not self.client:
-            logger.error("LLM client is not initialized. Cannot process request.")
-            raise OpenAIError("The AI service is not configured correctly.")
-            
-        session_id = request.session_id
-        if not session_id:
-            logger.warning("No session_id provided. Using 'default' session.")
-            session_id = "default_session"
-
-        # 1. Get history from cache
-        history = CHAT_HISTORY_CACHE.get(session_id, [])
-
-        # 2. Rasa NLU Step
-        nlu_data = self._mock_rasa_nlu(request.message)
-        intent = nlu_data.get("intent", {}).get("name", "unknown")
-
-        # 3. RAG Step
-        context = self._mock_rag_retriever(intent)
-        
-        logger.info(f"[Session: {session_id}] Retrieved RAG context for intent '{intent}': {context}")
-
-        # 4. LLM Generation Step
-        prompt = self._build_llm_prompt(request.message, intent, context, history)
-        
-        logger.info(f"[Session: {session_id}] Sending full prompt to LLM: {prompt}")
-
-        try:
-            completion = self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=prompt,
-                temperature=0.7,
-                max_tokens=200,
-            )
-            
-            llm_response = completion.choices[0].message.content.strip()
-            
-            # 5. Save to cache
-            history.append({"role": "user", "content": request.message})
-            history.append({"role": "assistant", "content": llm_response})
-            CHAT_HISTORY_CACHE[session_id] = history
-
-            return llm_response, intent, context
-
-        except OpenAIError as e:
-            logger.error(f"Error calling Azure OpenAI: {e}")
-            raise

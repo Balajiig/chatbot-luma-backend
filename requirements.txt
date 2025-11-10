@@ -1,5 +1,7 @@
 # requirements.txt
 fastapi
-uvicorn[standard]
+uvicorn
+pydantic
 pydantic-settings
-openai>=1.0.0
+openai
+numpy

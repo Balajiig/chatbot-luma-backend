@@ -1,24 +1,41 @@
 # config.py
+import logging
+from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from functools import lru_cache # <--- Import lru_cache here
 
 class Settings(BaseSettings):
-    # Load settings from the .env file
+    """
+    Loads all configuration settings from a .env file.
+    This version loads credentials for TWO separate Azure OpenAI resources:
+    1. A "CHAT" resource for the main LLM (NLU and responses)
+    2. An "EMBED" resource for the embedding model (RAG)
+    """
     model_config = SettingsConfigDict(
         env_file=".env", 
         env_file_encoding="utf-8", 
         extra="ignore",
-        frozen=True  # <--- !! ADD THIS LINE !!
+        frozen=True
     )
 
-    # Azure OpenAI Credentials
-    AZURE_OPENAI_ENDPOINT: str
-    AZURE_OPENAI_KEY: str
-    AZURE_API_VERSION: str
-    AZURE_OPENAI_DEPLOYMENT_NAME: str
+    # --- 1. CHAT Model Resource (Your existing 'spotn' resource) ---
+    AZURE_OPENAI_CHAT_ENDPOINT: str
+    AZURE_OPENAI_CHAT_KEY: str
+    AZURE_OPENAI_CHAT_API_VERSION: str
+    AZURE_OPENAI_CHAT_DEPLOYMENT_NAME: str  # Your 'gpt-4.1-nano'
+    
+    # --- 2. EMBEDDING Model Resource (Your new 'sp20254' resource) ---
+    AZURE_OPENAI_EMBED_ENDPOINT: str
+    AZURE_OPENAI_EMBED_KEY: str
+    AZURE_OPENAI_EMBED_API_VERSION: str
+    AZURE_OPENAI_EMBED_DEPLOYMENT_NAME: str # Your 'text-embedding-ada-002'
 
-# Create a single, cached instance of the settings
-# We will "depend" on this function in our API
-@lru_cache  # <--- Add cache here for efficiency
+@lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    """
+    Dependency function to get a single, cached instance of the Settings.
+    """
+    try:
+        return Settings()
+    except ValueError as e:
+        logging.error(f"Error loading settings. Is your .env file correct? {e}")
+        raise
