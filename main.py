@@ -30,7 +30,7 @@ async def startup_event():
 # --- CORS (Cross-Origin Resource Sharing) ---
 origins = [
     "http://localhost:3000", # Your Next.js dev server
-    "https://your-production-frontend.com", # Your production domain
+    "https://luma-479300.uc.r.appspot.com", # Your production domain
 ]
 
 app.add_middleware(
